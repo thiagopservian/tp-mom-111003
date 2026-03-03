@@ -5,6 +5,13 @@ import time
 
 from common.middleware import middleware_rabbitmq
 from utils.message_consumer_tester import MessageConsumerTester
+import requests
+from requests.auth import HTTPBasicAuth
+
+RABBITMQ_MANAGEMENT_PORT = 15672
+RABBITMQ_USER = os.environ.get("RABBITMQ_USER", "guest")
+RABBITMQ_PASS = os.environ.get("RABBITMQ_PASS", "guest")
+RABBITMQ_VHOST = os.environ.get("RABBITMQ_VHOST", "/")
 
 TEST_EXCHANGE_NAME = "test_exchange"
 
@@ -14,13 +21,75 @@ MOM_HOST = os.environ['MOM_HOST']
 # HELP FUNCTIONS
 # -----------------------------------------------------------------------------
 
+def _wait_for_queues(routing_keys_by_consumers, timeout=6, poll_interval=0.1):
+    """
+    Esperar a que todos los "bindings" esperados de las colas al exchange de prueba existan.
+    
+    ACLARACIÓN: Esta función sincroniza los "bindings" en un contexto en donde:
+    - No podemos extender el middleware ni agregarle lógica
+    - No podemos asumir la existencia de mecanismos de sincronización en el middleware
+    - Agregar lógica adicional de comunicación entre componentes complejizaría los casos de prueba
+    
+    Si se te presenta un caso que pensás que amerita una solución similar; evalua exhaustivamente que no haya mejores opciones;
+    y recordá, este tipo de lógica debería estar en el middleware, que es el componente que abstrae la lógica de comunicación.
+    """
+    
+    bindings_per_key = {}
+
+    for routing_keys in routing_keys_by_consumers.values():
+        for key in routing_keys:
+            bindings_per_key[key] = bindings_per_key.get(key, 0) + 1
+
+    url = (
+        f"http://{MOM_HOST}:{RABBITMQ_MANAGEMENT_PORT}"
+        f"/api/exchanges/{requests.utils.quote(RABBITMQ_VHOST, safe='')}"
+        f"/{requests.utils.quote(TEST_EXCHANGE_NAME, safe='')}"
+        f"/bindings/source"
+    )
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            auth = HTTPBasicAuth(RABBITMQ_USER, RABBITMQ_PASS)
+            response = requests.get(url, auth= auth, timeout=2)
+            response.raise_for_status()
+            bindings = response.json()
+        except Exception as e:
+            # Might fail if the exchange is not declared yet
+            time.sleep(poll_interval)
+            continue
+
+        actual_bindings = {}
+
+        for binding in bindings:
+            if binding.get("destination_type") != "queue":
+                continue
+            key = binding.get("routing_key")
+            if key:
+                actual_bindings[key] = actual_bindings.get(key, 0) + 1
+
+
+        all_ready = True
+        for key, expected_count in bindings_per_key.items():
+            if actual_bindings.get(key, 0) < expected_count:
+                all_ready = False
+                break
+
+        if all_ready:
+            return
+
+        time.sleep(poll_interval)
+
+    raise TimeoutError(
+        f"Timed out waiting for bindings on exchange '{TEST_EXCHANGE_NAME}'. "
+        f"Expected: {bindings_per_key}"
+    )
+
 def _message_set_consumer(message_set, messages_before_close, routing_keys):
 	consumer_exchange = middleware_rabbitmq.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, TEST_EXCHANGE_NAME, routing_keys)
 	message_consumer_tester = MessageConsumerTester(consumer_exchange, message_set, messages_before_close)
 	consumer_exchange.start_consuming(lambda message, ack, nack: message_consumer_tester.callback(message, ack, nack))
-
-def _generate_messages(amount):
-	return list(map(lambda n: bytes(f"{n}", "utf-8"), range(amount)))
 
 def _test_exchange(routing_keys_by_consumers, messages_by_routing_key):
 	with multiprocessing.Manager() as manager:
@@ -38,8 +107,7 @@ def _test_exchange(routing_keys_by_consumers, messages_by_routing_key):
 			consummer_process.start()
 			consummer_processes.append(consummer_process)
 
-		#TODO: Barrier to sync actual exchange consumming before sending messages
-		time.sleep(0.5)
+		_wait_for_queues(routing_keys_by_consumers)
 
 		for routing_key, messages in messages_by_routing_key.items():
 			producer_exchange = middleware_rabbitmq.MessageMiddlewareExchangeRabbitMQ(MOM_HOST, TEST_EXCHANGE_NAME, [routing_key])
