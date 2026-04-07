@@ -1,41 +1,81 @@
 # Trabajo Práctico - Middlewares Orientados a Mensajes
 
-Los middlewares orientados a mensajes (MOMs) son un recurso importante para el control de la complejidad en los sistemas distribuídos, puesto que permiten a las distintas partes del sistema comunicarse abstrayéndose de problemas como los cambios de ubicación, fallos, performance y escalabilidad.
+## Implementación (Python)
 
-En este repositorio se proveen conjuntos de pruebas para los dos formas más comunes de organización de la comunicación sobre colas, que en RabbitMQ se denominan Work Queues y Exchanges.
+El único archivo modificado es:
 
-Se recomienda familiarizarse con estos conceptos leyendo la documentación de RabbitMQ y siguiendo los [tutoriales introductorios](https://www.rabbitmq.com/tutorials).
+```
+python/src/common/middleware/middleware_rabbitmq.py
+```
 
-## Condiciones de Entrega
+Este archivo implementa las interfaces abstractas definidas en `middleware.py`:
 
-El código de este repositorio se agrupa en dos carpetas, una para Python y otra para Golang. Los estudiantes deberán elegir **sólo uno** de estos lenguajes y completar la implementación de las interfaces de middleware provistas con el objetivo de pasar las pruebas asociadas.
+| Clase | Patrón | Descripción |
+|---|---|---|
+| `MessageMiddlewareQueueRabbitMQ` | Work Queue | Cada mensaje es entregado a **exactamente un** consumidor. Múltiples consumidores compiten. |
+| `MessageMiddlewareExchangeRabbitMQ` | Exchange (topic) | Cada consumidor recibe su **propia copia** de los mensajes publicados a las routing keys a las que está suscripto. |
 
-Al momento de la evaluación y ejecución de las pruebas se **descartarán** los cambios realizados a todos los archivos, a excepción de:
+### Diseño de la Queue
 
-**Python:** `/python/src/common/middleware/middleware_rabbitmq.py` 
+- Se conecta a RabbitMQ y declara la cola en `__init__`. La declaración es idempotente: múltiples productores/consumidores pueden declararla sin conflicto.
+- `send()` publica al **default exchange** con la cola como routing key.
+- `start_consuming()` inicia un consumo bloqueante con `auto_ack=False`. El callback recibe `(message, ack, nack)` y decide cuándo confirmar.
+- `stop_consuming()` detiene el loop. Si no se estaba consumiendo, no tiene efecto (protegido con `try/except`).
 
-**Golang:** `/golang/internal/factory/*/*.go` 
+### Diseño del Exchange
+
+- En `__init__` se declara el exchange como tipo `topic`. **No** se crea la cola aún.
+- La cola se crea en `start_consuming()`, justo antes de activar el consumo. Es anónima, exclusiva y con `auto_delete=True`, lo que garantiza que:
+  - Cada consumidor tiene su propia cola → **cada uno recibe todos los mensajes** (broadcast).
+  - La cola se elimina automáticamente al cerrar la conexión.
+- Se hace `queue_bind` para cada routing key antes de empezar a consumir, garantizando que los bindings están activos cuando el productor publica.
+- `send()` publica al exchange una vez por cada routing key configurada.
+- `stop_consuming()` también está protegido con `try/except`.
+
+### Manejo de errores
+
+| Situación | Excepción elevada |
+|---|---|
+| Pérdida de conexión al enviar/consumir | `MessageMiddlewareDisconnectedError` |
+| Error interno en el procesamiento | `MessageMiddlewareMessageError` |
+| Error al cerrar la conexión | `MessageMiddlewareCloseError` |
+
+---
+
+## Resultados de las pruebas
+
+Ejecutadas con `make up` sobre Python 3.14.3 (Alpine, Docker):
+
+```
+tests  | ============================= test session starts ==============================
+tests  | platform linux -- Python 3.14.3, pytest-9.0.2, pluggy-1.6.0
+tests  | rootdir: /
+tests  | configfile: pytest.ini
+tests  | testpaths: test_queue.py, test_exchange.py
+tests  | plugins: timeout-2.4.0
+tests  | timeout: 10.0s
+tests  | timeout method: signal
+tests  | timeout func_only: False
+tests  | collected 19 items
+tests  | 
+tests  | test_queue.py .............                                              [ 68%]
+tests  | test_exchange.py ......                                                  [100%]
+tests  | 
+tests  | ============================== 19 passed in 2.71s ==============================
+```
+
+---
+
+
 
 ## Ejecución
 
-`make up` : Inicia contenedores de RabbitMQ  y de pruebas de integración. Comienza a seguir los logs de las pruebas.
+```bash
+make up      # Inicia RabbitMQ y corre las pruebas en Docker
+make down    # Detiene y destruye los contenedores
+make logs    # Sigue los logs de todos los contenedores
+```
 
-`make down`:   Detiene los contenedores de pruebas y destruye los recursos asociados.
 
-`make logs`: Sigue los logs de todos los contenedores en un solo flujo de salida.
 
-`make local`: Ejecuta las pruebas de integración desde el Host, facilitando el desarrollo. Se explica con mayor detalle dentro de su sección.
 
-## Pruebas locales desde el Host
-
-Habiendo iniciado el contenedor de RabbitMQ o configurado una instancia local del mismo pueden ejecutarse las pruebas sin necesidad de detener y reiniciar los contenedores ejecutando `make local`, siempre que se cumplan los siguientes requisitos.
-
-### Python
-Instalar una versión de Python superior a `3.14`. Se recomienda emplear un gestor de versiones, como ser `pyenv`.
-Instalar los dependencias de la suite de pruebas:
-`pip install -r python/src/tests/requirements.txt`
-
-### Golang
-Instalar una versión de Golang superior a `1.24`.
-Instalar los dependencias de la suite de pruebas:
-`go mod download`
